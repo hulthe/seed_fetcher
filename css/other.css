@@ -1,0 +1,18 @@
+.duplicate {
+    display: grid;
+    color: #dabdab
+}
+
+.kebab-case {}
+
+.snake_case {}
+
+.fake-kebab-case {
+    opacity: 999;
+}
+
+.fake_kebab_case {
+    grid-template-areas:
+        "snake_case! It was you all along!"
+        "And I would have gotten away with it too, if it weren't for you meddling kids...";
+}
