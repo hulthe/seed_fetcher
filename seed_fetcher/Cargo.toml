@@ -1,0 +1,13 @@
+[package]
+name = "seed_fetcher"
+version = "0.1.0"
+authors = ["Joakim Hulthe <joakim@hulthe.net>"]
+edition = "2018"
+
+[dependencies]
+seed = "0.8"
+serde = "1"
+serde_json = "1"
+
+[dependencies.seed_fetcher_derive]
+path = "../seed_fetcher_derive"
