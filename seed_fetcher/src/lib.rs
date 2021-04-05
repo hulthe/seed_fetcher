@@ -1,5 +1,5 @@
 use seed::app::orders::Orders;
-use seed::fetch::{fetch, FetchError};
+use seed::fetch::{fetch, FetchError, Header, Request};
 use seed::{error, log};
 use serde::de::DeserializeOwned;
 use std::any::Any;
@@ -17,7 +17,9 @@ pub struct ResourceStore {
     cache: HashMap<Resource, CacheEntry>,
 }
 
-type DeserializeFn = Arc<Box<dyn Fn(&str) -> Result<Box<dyn Any>, ()>>>;
+type DeserializeFn = Arc<Box<dyn Fn(ContentType, &[u8]) -> Result<Box<dyn Any>, ()>>>;
+
+const ACCEPT_HEADER: &str = "application/msgpack, application/json;q=0.5";
 
 #[derive(Clone, Debug)]
 pub enum ResourceMsg {
@@ -32,9 +34,16 @@ enum CacheEntry {
     Fetched(CachedResource),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ContentType {
+    Json,
+    MsgPack,
+}
+
 #[derive(Clone, Debug)]
 pub struct CachedResource {
-    raw: String,
+    raw: Vec<u8>,
+    content_type: ContentType,
     freshness: Freshness,
     deserialized: Arc<dyn Any>,
 }
@@ -134,27 +143,60 @@ impl ResourceStore {
                 log!("resource requested", resource);
                 orders.perform_cmd(async move {
                     let request = move || async move {
-                        let response = fetch(resource).await?;
-                        let text = response.text().await?;
-                        Ok(text)
+                        let response = fetch(
+                            Request::new(resource).header(Header::custom("Accept", ACCEPT_HEADER)),
+                        )
+                        .await?;
+                        let bytes = response.bytes().await?;
+                        let content_type = response
+                            .raw_response()
+                            .headers()
+                            .get("content-type")
+                            .expect("failed to get header");
+                        Ok((bytes, content_type))
                     };
                     let response: Result<_, FetchError> = request().await;
 
                     match response {
-                        Ok(data) => match deserialize(&data) {
-                            Ok(deserialized) => {
-                                let cr = CachedResource {
-                                    freshness: Freshness::Fresh,
-                                    raw: data,
-                                    deserialized: deserialized.into(),
-                                };
-                                ResourceMsg::Fetched(resource, cr)
+                        Ok((bytes, Some(content_type))) => {
+                            let content_type = match content_type.as_str() {
+                                "application/json" => ContentType::Json,
+                                "application/msgpack" => ContentType::MsgPack,
+                                _ => {
+                                    error!(
+                                        &format!(
+                                            "unsupported content-type {} for resource",
+                                            content_type
+                                        ),
+                                        resource
+                                    );
+                                    return ResourceMsg::Error(resource);
+                                }
+                            };
+
+                            match deserialize(content_type, &bytes) {
+                                Ok(deserialized) => {
+                                    let cr = CachedResource {
+                                        raw: bytes,
+                                        content_type,
+                                        freshness: Freshness::Fresh,
+                                        deserialized: deserialized.into(),
+                                    };
+                                    ResourceMsg::Fetched(resource, cr)
+                                }
+                                Err(()) => {
+                                    error!("failed to deserialize resource", resource);
+                                    ResourceMsg::Error(resource)
+                                }
                             }
-                            Err(()) => {
-                                error!("failed to deserialize resource", resource);
-                                ResourceMsg::Error(resource)
-                            }
-                        },
+                        }
+                        Ok((_, None)) => {
+                            error!(
+                                "failed to deserialize resource, missing content-type",
+                                resource
+                            );
+                            ResourceMsg::Error(resource)
+                        }
                         Err(fetch_error) => {
                             error!(format!("error fetching resource {}", resource), fetch_error);
                             ResourceMsg::Error(resource)
@@ -237,8 +279,12 @@ impl ResourceStore {
         if fetch {
             orders.notify(event::Request {
                 resource,
-                deserialize: Arc::new(Box::new(|s| {
-                    let v: Box<T> = Box::new(serde_json::from_str(s).map_err(|_| ())?);
+                deserialize: Arc::new(Box::new(|content_type, bytes| {
+                    let deserialized = match content_type {
+                        ContentType::Json => serde_json::from_slice(&bytes).map_err(|_| ())?,
+                        ContentType::MsgPack => rmp_serde::from_read_ref(&bytes).map_err(|_| ())?,
+                    };
+                    let v: Box<T> = Box::new(deserialized);
                     Ok(v)
                 })),
             });
