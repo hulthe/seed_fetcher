@@ -17,15 +17,23 @@ pub struct ResourceStore {
     cache: HashMap<Resource, CacheEntry>,
 }
 
-type DeserializeFn = Arc<Box<dyn Fn(ContentType, &[u8]) -> Result<Box<dyn Any>, ()>>>;
+type DeserializeFn = Arc<dyn Fn(ContentType, &[u8]) -> Result<Box<dyn Any>, ()>>;
 
 const ACCEPT_HEADER: &str = "application/msgpack, application/json;q=0.5";
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    DeserializeError,
+    FetchError(Arc<FetchError>),
+    UnsupportedContentType { content_type: String },
+}
 
 #[derive(Clone, Debug)]
 pub enum ResourceMsg {
     Request(event::Request),
     Fetched(Resource, CachedResource),
-    Error(Resource),
+    Error { resource: Resource, kind: ErrorKind },
     MarkDirty(event::MarkDirty),
 }
 
@@ -80,7 +88,7 @@ pub enum CachePolicy {
 pub struct DontFetch;
 
 pub mod event {
-    use super::{DeserializeFn, Resource};
+    use super::{DeserializeFn, ErrorKind, Resource};
     use std::fmt;
 
     /// A resource was requested to be fetched
@@ -95,8 +103,11 @@ pub mod event {
     pub struct Fetched(pub Resource);
 
     /// A resource was fetched
-    #[derive(Clone, Copy, Debug)]
-    pub struct Error(pub Resource);
+    #[derive(Clone, Debug)]
+    pub struct Error {
+        pub resource: Resource,
+        pub kind: ErrorKind,
+    }
 
     /// A resource was marked as dirty
     #[derive(Clone, Copy, Debug)]
@@ -143,10 +154,11 @@ impl ResourceStore {
                 log!("resource requested", resource);
                 orders.perform_cmd(async move {
                     let request = move || async move {
-                        let response = fetch(
-                            Request::new(resource).header(Header::custom("Accept", ACCEPT_HEADER)),
-                        )
-                        .await?;
+                        let request =
+                            Request::new(resource).header(Header::custom("Accept", ACCEPT_HEADER));
+
+                        let response = fetch(request).await?.check_status()?;
+
                         let bytes = response.bytes().await?;
                         let content_type = response
                             .raw_response()
@@ -170,7 +182,10 @@ impl ResourceStore {
                                         ),
                                         resource
                                     );
-                                    return ResourceMsg::Error(resource);
+                                    return ResourceMsg::Error {
+                                        resource,
+                                        kind: ErrorKind::UnsupportedContentType { content_type },
+                                    };
                                 }
                             };
 
@@ -186,7 +201,10 @@ impl ResourceStore {
                                 }
                                 Err(()) => {
                                     error!("failed to deserialize resource", resource);
-                                    ResourceMsg::Error(resource)
+                                    ResourceMsg::Error {
+                                        resource,
+                                        kind: ErrorKind::DeserializeError,
+                                    }
                                 }
                             }
                         }
@@ -195,11 +213,19 @@ impl ResourceStore {
                                 "failed to deserialize resource, missing content-type",
                                 resource
                             );
-                            ResourceMsg::Error(resource)
+                            ResourceMsg::Error {
+                                resource,
+                                kind: ErrorKind::UnsupportedContentType {
+                                    content_type: String::new(),
+                                },
+                            }
                         }
                         Err(fetch_error) => {
                             error!(format!("error fetching resource {}", resource), fetch_error);
-                            ResourceMsg::Error(resource)
+                            ResourceMsg::Error {
+                                resource,
+                                kind: ErrorKind::FetchError(Arc::new(fetch_error)),
+                            }
                         }
                     }
                 });
@@ -209,8 +235,8 @@ impl ResourceStore {
                 self.cache.insert(resource, CacheEntry::Fetched(data));
                 orders.notify(event::Fetched(resource));
             }
-            ResourceMsg::Error(resource) => {
-                orders.notify(event::Error(resource));
+            ResourceMsg::Error { resource, kind } => {
+                orders.notify(event::Error { resource, kind });
             }
             ResourceMsg::MarkDirty(event::MarkDirty(resource)) => {
                 if let Some(CacheEntry::Fetched(r)) = self.cache.get_mut(&resource) {
@@ -279,14 +305,14 @@ impl ResourceStore {
         if fetch {
             orders.notify(event::Request {
                 resource,
-                deserialize: Arc::new(Box::new(|content_type, bytes| {
+                deserialize: Arc::new(|content_type, bytes| {
                     let deserialized = match content_type {
                         ContentType::Json => serde_json::from_slice(&bytes).map_err(|_| ())?,
                         ContentType::MsgPack => rmp_serde::from_read_ref(&bytes).map_err(|_| ())?,
                     };
                     let v: Box<T> = Box::new(deserialized);
                     Ok(v)
-                })),
+                }),
             });
         }
 
